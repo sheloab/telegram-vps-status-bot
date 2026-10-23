@@ -1,0 +1,6 @@
+bot.env
+__pycache__/
+*.bak*
+offset.txt
+*_state.txt
+unauthorized_access.log

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram status bot for PRIVATE-SERVER
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=guest
+WorkingDirectory=/home/guest/telegram-vps-status-bot
+EnvironmentFile=/home/guest/telegram-vps-status-bot/bot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/guest/telegram-vps-status-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

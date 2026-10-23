@@ -1,0 +1,10 @@
+# Telegram status bot: do not log its background polling
+# (login watcher psql every 20s, auth watcher docker logs every 15s, nginx log reads for alerts).
+# Interactive /status, /docker, ... commands are still logged.
+# Replace owner-domain01.com with your GUAC_DOMAIN. Install with:
+#   sudo install -m 440 deploy/sudoers-telegram-bot-quiet /etc/sudoers.d/telegram-bot-quiet && sudo visudo -c
+Cmnd_Alias TGBOT_POLL = /usr/bin/docker exec guacstack-postgres psql -U guacamole_user -d guacamole_db *, \
+                        /usr/bin/docker logs -t --since * guacstack-guacamole, \
+                        /usr/bin/tail -n 6000 /var/log/nginx/owner-domain01.com-access.log, \
+                        /usr/bin/tail -n 400 /var/log/nginx/owner-domain01.com-access.log
+Defaults!TGBOT_POLL !log_allowed, !pam_session
