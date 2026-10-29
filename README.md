@@ -3,7 +3,8 @@
 A single-file Python bot that lets you check and manage your own Linux VPS from
 Telegram: host health, Docker containers, xrdp, nginx, who is logged in, banned
 IPs (fail2ban / UFW / nginx), one-tap unban, safe reboot — plus instant alerts
-for Apache Guacamole logins, failed logins, 2FA problems and bad restarts.
+for Apache Guacamole logins, failed logins, 2FA problems, dropped sessions and
+bad restarts.
 
 - **Python 3 standard library only** — no `pip install`.
 - **Locked to one chat.** Anyone else who messages the bot is logged and you get
@@ -63,6 +64,12 @@ as down or empty. Two exceptions to know about:
 - **Guacamole login** — user, IP, ISP, reverse DNS, browser/OS, and whether the
   2FA (TOTP) step completed within 90 s.
 - **Guacamole connection opened** — which RDP/SSH connection, from which IP.
+  Login and connection alerts are sent once per user/IP per hour, so reconnects
+  stay quiet; this memory is kept on disk, so restarting the bot doesn't repeat them.
+- **Guacamole session dropped** — a session that ended abnormally (e.g. the
+  browser stopped answering for 15 s on a flaky Wi-Fi link): connection, time,
+  session length and reason. The first drop is sent at once; further drops within
+  10 minutes come as one summary. Normal disconnects stay quiet.
 - **Failed logins / wrong 2FA / auto-blocked IPs** — at most one alert per IP
   and alert type per minute; the rest are summarised.
 - **Restart / reboot health check** — after a reboot or a Guacamole container

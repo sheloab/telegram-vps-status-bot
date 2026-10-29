@@ -4,3 +4,4 @@ __pycache__/
 offset.txt
 *_state.txt
 unauthorized_access.log
+*_dedupe.json

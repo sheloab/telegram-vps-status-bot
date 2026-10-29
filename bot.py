@@ -338,6 +338,21 @@ GUAC_DB_CMD = (
 )
 
 
+def guac_started():
+    """Latest start time of guacd and the Guacamole web app (ISO, UTC), or None.
+
+    A restart of either one drops every session without closing its history
+    row, so rows opened before the later of the two are stale.
+    """
+    times = run(
+        "sudo -n docker inspect -f '{{.State.StartedAt}}' "
+        "guacstack-guacd guacstack-guacamole"
+    ).split()
+    if len(times) != 2 or not all(re.fullmatch(r"[0-9T:.\-]+Z", t) for t in times):
+        return None
+    return max(t[:19] for t in times) + "Z"
+
+
 def fmt_duration(seconds):
     seconds = max(int(seconds), 0)
     d, rem = divmod(seconds, 86400)
@@ -380,12 +395,10 @@ def recent_web_client_ips(window_s=900):
 
 def guac_sessions():
     """Active Guacamole sessions: (user, connection, seconds, client_ip)."""
-    started = run(
-        "sudo -n docker inspect -f '{{.State.StartedAt}}' guacstack-guacd"
-    ).strip()
-    if not re.fullmatch(r"[0-9T:.\-]+Z", started):
+    started = guac_started()
+    if not started:
         return None
-    # Rows left open from before guacd's last restart are stale, skip them.
+    # Rows left open from before the last guacd/web restart are stale, skip them.
     sql = (
         "select username, connection_name, "
         "extract(epoch from now()-start_date)::int, remote_host "
@@ -504,8 +517,8 @@ def fmt_since(epoch):
 def guac_active():
     """Live Guacamole web logins and their open connections, grouped by (user, ip).
     Returns {(user, ip): {"start", "tabs", "conns": [(kind, name, start)]}} or None."""
-    started = run("sudo -n docker inspect -f '{{.State.StartedAt}}' guacstack-guacd").strip()
-    if not re.fullmatch(r"[0-9T:.\-]+Z", started):
+    started = guac_started()
+    if not started:
         return None
     # Rows still open from before the last container restart are stale.
     logins = guac_sql(
@@ -563,15 +576,28 @@ def ssh_logins():
 
 
 def xrdp_desktops():
-    """xrdp desktop sessions: [(user, display, start_epoch)] from the Xorg processes."""
+    """xrdp desktop sessions: [(user, display, start_epoch, where)] from the Xorg processes.
+
+    Containers run their own xrdp, so the same display number can show up
+    twice; `where` is "host" or the container name.
+    """
+    names = {}
+    for line in run("sudo -n docker ps --no-trunc --format '{{.ID}} {{.Names}}'").splitlines():
+        f = line.split()
+        if len(f) == 2:
+            names[f[0]] = f[1]
     rows = []
-    for line in run("ps -eo user=,lstart=,args=").splitlines():
-        m = re.match(r"(\S+)\s+(\w{3} \w{3} +\d+ [\d:]+ \d{4})\s+\S*Xorg (:\d+) .*xrdp", line)
-        if m:
-            try:
-                rows.append((m.group(1), m.group(3), time.mktime(time.strptime(m.group(2), "%a %b %d %H:%M:%S %Y"))))
-            except ValueError:
-                pass
+    for line in run("ps -eo pid=,user=,lstart=,args=").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)\s+(\w{3} \w{3} +\d+ [\d:]+ \d{4})\s+\S*Xorg (:\d+) .*xrdp", line)
+        if not m:
+            continue
+        pid, user, lstart, display = m.groups()
+        cid = re.search(r"docker-([0-9a-f]{64})\.scope", run(f"sudo -n cat /proc/{pid}/cgroup"))
+        where = names.get(cid.group(1), "container") if cid else "host"
+        try:
+            rows.append((user, display, time.mktime(time.strptime(lstart, "%a %b %d %H:%M:%S %Y")), where))
+        except ValueError:
+            pass
     return rows
 
 
@@ -611,8 +637,12 @@ def cmd_sessions(_args):
             lines.append(f"  ⚠️ direct client (not via Guacamole): {ip} · {ip_info(ip)}")
     else:
         lines.append("  direct clients: none (RDP only via Guacamole)")
-    for user, display, start in xrdp_desktops():
-        lines.append(f"  desktop {display} user {user} since {fmt_since(start)}")
+    for user, display, start, where in xrdp_desktops():
+        if where == "host":
+            lines.append(f"  desktop {display} user {user} (host) since {fmt_since(start)}")
+        else:
+            # ps maps the container's uid to a host name, so the user is not shown.
+            lines.append(f"  desktop {display} in {where} since {fmt_since(start)}")
 
     return "\n".join(lines)
 
@@ -1152,6 +1182,9 @@ LOGIN_STATE_FILE = os.environ.get(
 )
 LOGIN_POLL_S = 20
 LOGIN_DEDUPE_S = 3600  # one alert per (user, IP) per hour
+LOGIN_DEDUPE_FILE = os.environ.get(
+    "LOGIN_DEDUPE_FILE", os.path.join(BOT_DIR, "login_dedupe.json")
+)
 UA_LOG_RE = re.compile(
     r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) (\S+)[^"]*" (\d{3}) \S+ "[^"]*" "([^"]*)"'
 )
@@ -1422,8 +1455,8 @@ def login_watcher():
             time.sleep(LOGIN_POLL_S)
         else:
             save_login_cursor(cursor)
-    print(f"login watcher started, cursor={cursor}")
-    last_alert = {}
+    last_alert = load_dedupe(LOGIN_DEDUPE_FILE, LOGIN_DEDUPE_S)
+    print(f"login watcher started, cursor={cursor}, dedupe entries={len(last_alert)}")
     while True:
         try:
             for row in new_login_rows(cursor):
@@ -1432,6 +1465,7 @@ def login_watcher():
                     if not send_alert_with_retry(format_login_alert(row)):
                         break  # keep the cursor; retry on the next poll
                     last_alert[key] = row[4]
+                    save_dedupe(LOGIN_DEDUPE_FILE, last_alert, LOGIN_DEDUPE_S)
                 cursor = row[0]
                 save_login_cursor(cursor)
         except Exception as e:
@@ -1565,6 +1599,9 @@ CONN_STATE_FILE = os.environ.get(
 )
 CONN_POLL_S = 20
 CONN_DEDUPE_S = 3600  # one alert per (user, connection, IP) per hour; reconnects stay quiet
+CONN_DEDUPE_FILE = os.environ.get(
+    "CONN_DEDUPE_FILE", os.path.join(BOT_DIR, "conn_dedupe.json")
+)
 PROTOCOL_NAMES = {"rdp": "RDP", "ssh": "SSH", "vnc": "VNC", "telnet": "Telnet"}
 
 
@@ -1641,8 +1678,8 @@ def connection_watcher():
             time.sleep(CONN_POLL_S)
         else:
             save_conn_cursor(cursor)
-    print(f"connection watcher started, cursor={cursor}")
-    last_alert = {}
+    last_alert = load_dedupe(CONN_DEDUPE_FILE, CONN_DEDUPE_S)
+    print(f"connection watcher started, cursor={cursor}, dedupe entries={len(last_alert)}")
     while True:
         try:
             for row in new_connection_rows(cursor):
@@ -1651,6 +1688,7 @@ def connection_watcher():
                     if not send_alert_with_retry(format_connection_alert(row)):
                         break  # keep the cursor; retry on the next poll
                     last_alert[key] = row[7]
+                    save_dedupe(CONN_DEDUPE_FILE, last_alert, CONN_DEDUPE_S)
                 cursor = row[0]
                 save_conn_cursor(cursor)
         except Exception as e:
@@ -1692,6 +1730,29 @@ def save_text_state(path, value):
             f.write(value)
     except Exception as e:
         print(f"save state failed ({path}): {e}")
+
+
+def load_dedupe(path, window_s):
+    """{key tuple: epoch of last alert} from disk, so a bot restart doesn't re-send
+    alerts the dedupe window already covered. Entries older than the window are dropped."""
+    try:
+        with open(path) as f:
+            rows = json.load(f)
+    except Exception:
+        return {}
+    now = time.time()
+    return {tuple(key): epoch for key, epoch in rows if now - epoch < window_s}
+
+
+def save_dedupe(path, last_alert, window_s):
+    now = time.time()
+    rows = [[list(key), epoch] for key, epoch in last_alert.items() if now - epoch < window_s]
+    try:
+        with open(path, "w") as f:
+            json.dump(rows, f)
+        os.chmod(path, 0o600)
+    except Exception as e:
+        print(f"save dedupe failed ({path}): {e}")
 
 
 def clean_text(value, limit=60):
@@ -1818,6 +1879,130 @@ def auth_event_watcher():
         time.sleep(AUTH_POLL_S)
 
 
+# --- Guacamole session-dropped alerts --------------------------------------
+# A drop is a disconnect that guacamole logged as "terminated abnormally" on the
+# same thread just before. Normal disconnects (tab closed, logged off) stay quiet.
+# The first drop is sent at once; further drops within DROP_BATCH_S are bundled
+# into one summary so a bad Wi-Fi spell doesn't flood the chat.
+DROP_STATE_FILE = os.environ.get(
+    "DROP_STATE_FILE", os.path.join(BOT_DIR, "drop_watch_state.txt")
+)
+DROP_POLL_S = 15
+DROP_BATCH_S = 600
+DROP_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T[\d:.]+Z) \S+ \[([^\]]+)\] \w+\s+\S+ - (.*)$")
+DROP_ABNORMAL_RE = re.compile(r"terminated abnormally: (.*?)\.?$")
+DROP_DISC_RE = re.compile(
+    r'User "(.*)" disconnected from connection "(\d+)"\. Duration: (\d+) milliseconds'
+)
+DROP_HINTS = {
+    "Connection to guacd timed out": (
+        "your browser stopped answering for 15s (Wi-Fi/network stall); "
+        "Guacamole reconnects by itself"
+    ),
+}
+_conn_names = {}
+
+
+def connection_name(conn_id):
+    if conn_id not in _conn_names:
+        name = guac_sql(
+            f"select connection_name from guacamole_connection where connection_id = {int(conn_id)}"
+        ).strip()
+        _conn_names[conn_id] = name or f"connection {conn_id}"
+    return _conn_names[conn_id]
+
+
+def parse_drop_log(text, cursor, pending):
+    """Drops from `docker logs -t` text, newer than `cursor`.
+
+    `pending` maps thread -> abnormal reason and is kept between polls, because the
+    reason and the disconnect line can straddle two polls.
+    """
+    drops, last_ts = [], cursor
+    for line in text.splitlines():
+        m = DROP_LINE_RE.match(line)
+        if not m:
+            continue
+        ts, thread, msg = m.groups()
+        if ts <= cursor:
+            continue
+        last_ts = max(last_ts, ts)
+        ab = DROP_ABNORMAL_RE.search(msg)
+        if ab:
+            pending[thread] = ab.group(1)
+            continue
+        disc = DROP_DISC_RE.search(msg)
+        if disc and thread in pending:
+            user, conn_id, ms = disc.groups()
+            epoch = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+            drops.append(
+                {"ts": ts, "epoch": epoch, "user": user, "conn_id": conn_id,
+                 "seconds": int(ms) // 1000, "reason": pending.pop(thread)}
+            )
+    return drops, last_ts
+
+
+def hm_duration(seconds):
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {secs:02d}s"
+
+
+def format_drop_alert(drop):
+    when = time.strftime("%a, %d %b %Y %H:%M:%S %Z", time.localtime(drop["epoch"]))
+    lines = [
+        "⚠️ Guacamole session dropped",
+        f"Connection: {connection_name(drop['conn_id'])}",
+        f"User: {drop['user']}",
+        f"Time: {when}",
+        f"Session length: {hm_duration(drop['seconds'])}",
+        f"Reason: {drop['reason']}",
+    ]
+    hint = DROP_HINTS.get(drop["reason"])
+    if hint:
+        lines.append(f"Meaning: {hint}")
+    return "\n".join(lines)
+
+
+def format_drop_summary(drops):
+    lines = [f"⚠️ {len(drops)} more Guacamole drop(s) in the last {DROP_BATCH_S // 60}m:"]
+    for d in drops:
+        when = time.strftime("%H:%M:%S %Z", time.localtime(d["epoch"]))
+        lines.append(
+            f"- {when} · {connection_name(d['conn_id'])} · after "
+            f"{hm_duration(d['seconds'])} · {d['reason']}"
+        )
+    return "\n".join(lines)
+
+
+def drop_watcher():
+    cursor = load_text_state(DROP_STATE_FILE)
+    if cursor is None:
+        cursor = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000000Z"
+        save_text_state(DROP_STATE_FILE, cursor)
+    print(f"drop watcher started, cursor={cursor}")
+    pending, held, last_sent = {}, [], 0.0
+    while True:
+        try:
+            text = run(f"sudo -n docker logs -t --since {cursor} {GUAC_CONTAINER} 2>&1", timeout=30)
+            drops, last_ts = parse_drop_log(text, cursor, pending)
+            for drop in drops:
+                if not held and time.time() - last_sent >= DROP_BATCH_S:
+                    if send_alert_with_retry(format_drop_alert(drop)):
+                        last_sent = time.time()
+                        continue
+                held.append(drop)
+            if held and time.time() - last_sent >= DROP_BATCH_S:
+                if send_alert_with_retry(format_drop_summary(held)):
+                    held, last_sent = [], time.time()
+            if last_ts > cursor:
+                cursor = last_ts
+                save_text_state(DROP_STATE_FILE, cursor)
+        except Exception as e:
+            print(f"drop watcher error: {e}")
+        time.sleep(DROP_POLL_S)
+
+
 def main():
     offset = load_offset()
     print(f"Starting bot, offset={offset}")
@@ -1825,6 +2010,7 @@ def main():
     threading.Thread(target=login_watcher, daemon=True, name="login-watcher").start()
     threading.Thread(target=connection_watcher, daemon=True, name="conn-watcher").start()
     threading.Thread(target=auth_event_watcher, daemon=True, name="auth-watcher").start()
+    threading.Thread(target=drop_watcher, daemon=True, name="drop-watcher").start()
     threading.Thread(target=restart_watcher, daemon=True, name="restart-watcher").start()
     while True:
         try:
