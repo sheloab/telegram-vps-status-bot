@@ -47,7 +47,7 @@ as down or empty. Two exceptions to know about:
 
 | Command | What it does |
 |---|---|
-| `/status` | Host CPU/memory/disk, failed systemd units, core services, website checks, active sessions, every container |
+| `/status` | Host CPU/memory/disk, failed systemd units, core services, website checks (every nginx site, found automatically), active sessions, every container |
 | `/sessions` | Who is connected: user, start time, client IP, ISP/ASN, via Guacamole / SSH / RDP |
 | `/docker` | All containers with status and ports |
 | `/xrdp` | xrdp + xrdp-sesman state and leaked Xorg session check |
@@ -133,7 +133,7 @@ chmod 700 .
 ```bash
 cp bot.env.example bot.env
 chmod 600 bot.env
-nano bot.env        # set BOT_TOKEN, ALLOWED_CHAT_ID; optionally SITES, GUAC_DOMAIN, DB_TIMEZONE
+nano bot.env        # set BOT_TOKEN, ALLOWED_CHAT_ID; optionally SITES, SITE_PATHS, GUAC_DOMAIN, DB_TIMEZONE
 ```
 
 `bot.env` is in `.gitignore` — never commit it.

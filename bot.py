@@ -5,6 +5,7 @@ Polls Telegram's getUpdates, replies only to ALLOWED_CHAT_ID, and runs a
 small set of status checks (docker, xrdp, nginx, host resources).
 """
 import calendar
+import glob
 import ipaddress
 import json
 import os
@@ -182,9 +183,33 @@ def host_block():
     return text, xrdp_ok, nginx_ok
 
 
-SITES = os.environ.get(
-    "SITES", "owner-domain01.com owner-domain02.com"
-).split()
+# Sites for /status are discovered from nginx on every check, so a new site is monitored
+# as soon as it is enabled. SITES adds hosts that this VPS doesn't serve; SITE_PATHS gives
+# a check path for hosts whose "/" redirects elsewhere ("app.example.com=/healthz").
+NGINX_SITES_DIR = os.environ.get("NGINX_SITES_DIR", "/etc/nginx/sites-enabled")
+SITES_EXTRA = os.environ.get("SITES", "").split()
+SITE_PATHS = dict(x.split("=", 1) for x in os.environ.get("SITE_PATHS", "").split() if "=" in x)
+
+
+def discover_sites():
+    """Check entries ("host" or "host/path") for every nginx server_name, plus SITES."""
+    hosts = []
+    for path in sorted(glob.glob(os.path.join(NGINX_SITES_DIR, "*"))):
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        text = re.sub(r"#[^\n]*", "", text)
+        for m in re.finditer(r"\bserver_name\s+([^;]+);", text):
+            for name in m.group(1).split():
+                if name == "_" or name.startswith("~") or "*" in name or name in hosts:
+                    continue
+                hosts.append(name)
+    entries = [h + SITE_PATHS.get(h, "") for h in hosts]
+    for extra in SITES_EXTRA:
+        host = extra.split("/")[0]
+        entries = [e for e in entries if e.split("/")[0] != host] + [extra]
+    return entries
 CORE_SERVICES = ["docker", "fail2ban", "ssh", "sysstat"]
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -200,8 +225,15 @@ HARMLESS_ERR_RE = re.compile(
 
 
 def site_code(host):
+    # An entry may carry a path ("app.example.com/healthz") for sites whose "/" redirects
+    # elsewhere (e.g. to a sign-in provider); without one, "/" is checked.
+    url = f"https://{host}" if "/" in host else f"https://{host}/"
+    try:
+        socket.getaddrinfo(host.split("/")[0], 443)
+    except socket.gaierror:
+        return "no DNS"   # configured in nginx but not published: nothing to monitor
     # Browser UA: the nginx bot filter drops urllib's default UA with 444.
-    req = urllib.request.Request(f"https://{host}/", headers={"User-Agent": BROWSER_UA})
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return str(resp.status)
@@ -232,14 +264,15 @@ def vps_block():
         issues.append("down: " + ",".join(down))
 
     codes = {}
-    threads = [threading.Thread(target=lambda h=h: codes.__setitem__(h, site_code(h))) for h in SITES]
+    sites = discover_sites()
+    threads = [threading.Thread(target=lambda h=h: codes.__setitem__(h, site_code(h))) for h in sites]
     for t in threads:
         t.start()
     for t in threads:
         t.join(15)
-    bad_sites = [h for h in SITES if codes.get(h) != "200"]
+    bad_sites = [h for h in sites if codes.get(h) not in ("200", "no DNS")]
     if bad_sites:
-        issues.append(f"sites {len(SITES) - len(bad_sites)}/{len(SITES)}")
+        issues.append(f"sites {len(sites) - len(bad_sites)}/{len(sites)}")
 
     banned = 0
     for jail in all_jails():
@@ -265,7 +298,10 @@ def vps_block():
         "  services: " + "  ".join(f"{s} {'✅' if svc.get(s) == 'active' else '❌'}" for s in CORE_SERVICES),
         "  websites:",
     ]
-    lines += [f"    {'✅' if codes.get(h) == '200' else '❌'} {h} {codes.get(h, 'timeout')}" for h in SITES]
+    mark = {"200": "✅", "no DNS": "⚪"}
+    lines += [f"    {mark.get(codes.get(h), '❌')} {h} "
+              f"{'no DNS record (not public)' if codes.get(h) == 'no DNS' else codes.get(h, 'timeout')}"
+              for h in sites]
     lines.append(f"  banned IPs: {banned}")
     lines.append("  last shutdown: " + ("⚠️ UNCLEAN (crash/hang/power cut)" if "last shutdown unclean" in issues else "clean"))
     lines.append(f"  errors last 30 min: {len(errs)}" + (" (harmless boot noise filtered)" if not errs else ""))
