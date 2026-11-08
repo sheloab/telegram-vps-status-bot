@@ -429,11 +429,66 @@ def recent_web_client_ips(window_s=900):
     return sorted(seen)
 
 
+GUAC_LIVE_WINDOW_S = 1800  # sama dengan API_SESSION_TIMEOUT=30 menit di Guacamole
+
+
+def guac_tunnels():
+    """Number of remote connections guacd is really holding (one child process each); None if unreadable."""
+    out = run("sudo -n docker exec guacstack-guacd ps -eo pid,ppid")
+    lines = out.splitlines()
+    if not lines or not lines[0].split()[:2] == ["PID", "PPID"]:
+        return None
+    return sum(1 for ln in lines[1:] if len(ln.split()) == 2 and ln.split()[1] == "1" and ln.split()[0].isdigit())
+
+
+def guac_live():
+    """(tunnels, web_active): connections really open, and any Guacamole API traffic in the last 30 min.
+    Open history rows only prove a session is live if one of these is true; Guacamole leaves many rows
+    open after a session expired."""
+    return guac_tunnels(), bool(recent_web_client_ips(GUAC_LIVE_WINDOW_S))
+
+
+GUAC_BACKUP_DIR = os.path.expanduser("~/backups")
+
+
+def guac_purge(tunnels, web_active):
+    """Close history rows left open although nothing is live. Returns (login_rows, connection_rows) closed.
+    Connection rows are closed only when guacd holds no connection; login rows only when additionally
+    there was no Guacamole API traffic for 30 min. Backs up both tables first (once per day)."""
+    if tunnels is None:
+        return 0, 0
+    pending_c = guac_sql("select count(*) from guacamole_connection_history where end_date is null").strip()
+    pending_u = guac_sql("select count(*) from guacamole_user_history where end_date is null").strip()
+    do_c = tunnels == 0 and pending_c.isdigit() and int(pending_c) > 0
+    do_u = tunnels == 0 and not web_active and pending_u.isdigit() and int(pending_u) > 0
+    if not (do_c or do_u):
+        return 0, 0
+    day = time.strftime("%Y%m%d")
+    dump = os.path.join(GUAC_BACKUP_DIR, f"guac-history-{day}.sql")
+    if not os.path.exists(dump):
+        run("umask 077; sudo -n docker exec guacstack-postgres pg_dump -U guacamole_user -d guacamole_db "
+            f"-t guacamole_user_history -t guacamole_connection_history > {dump}", timeout=60)
+        if not os.path.exists(dump) or os.path.getsize(dump) < 200:
+            return 0, 0  # backup failed: do not modify anything
+    nc = nu = 0
+    if do_c:
+        out = guac_sql("with c as (update guacamole_connection_history set end_date = now() "
+                       "where end_date is null returning 1) select count(*) from c").strip()
+        nc = int(out) if out.isdigit() else 0
+    if do_u:
+        out = guac_sql("with u as (update guacamole_user_history set end_date = now() "
+                       "where end_date is null returning 1) select count(*) from u").strip()
+        nu = int(out) if out.isdigit() else 0
+    return nu, nc
+
+
 def guac_sessions():
     """Active Guacamole sessions: (user, connection, seconds, client_ip)."""
     started = guac_started()
     if not started:
         return None
+    if guac_tunnels() == 0:  # guacd holds no connection: any open row is stale
+        return []
     # Rows left open from before the last guacd/web restart are stale, skip them.
     sql = (
         "select username, connection_name, "
@@ -550,17 +605,33 @@ def fmt_since(epoch):
     return f"{time.strftime('%d %b %H:%M:%S', time.localtime(epoch))} ({fmt_duration(time.time() - epoch)} ago)"
 
 
-def guac_active():
+GUAC_NOTE = {"purged": (0, 0), "ignored": 0, "tunnels": None, "web": False}
+
+
+def guac_active(purge=False):
     """Live Guacamole web logins and their open connections, grouped by (user, ip).
-    Returns {(user, ip): {"start", "tabs", "conns": [(kind, name, start)]}} or None."""
+    Returns {(user, ip): {"start", "tabs", "conns": [(kind, name, start)]}} or None.
+    A login row counts only if it is younger than the 30-min session timeout or a connection is open;
+    older open rows are expired sessions Guacamole never closed (reported in GUAC_NOTE, optionally purged)."""
     started = guac_started()
     if not started:
         return None
-    # Rows still open from before the last container restart are stale.
+    tunnels, web = guac_live()
+    GUAC_NOTE.update(tunnels=tunnels, web=web, purged=(0, 0), ignored=0)
+    if purge:
+        GUAC_NOTE["purged"] = guac_purge(tunnels, web)
+    win = GUAC_LIVE_WINDOW_S
+    stale = guac_sql(
+        "select count(*) from guacamole_user_history "
+        f"where end_date is null and start_date >= '{started}' and start_date < now() - interval '{win} seconds'"
+    ).strip()
+    GUAC_NOTE["ignored"] = int(stale) if stale.isdigit() else 0
+    # Rows still open from before the last container restart are stale; so are rows older than the timeout.
     logins = guac_sql(
         "select username, coalesce(remote_host,''), extract(epoch from start_date)::bigint "
         "from guacamole_user_history "
-        f"where end_date is null and start_date >= '{started}'"
+        f"where end_date is null and start_date >= '{started}' "
+        f"and start_date >= now() - interval '{win} seconds'"
     )
     conns = guac_sql(
         "select h.username, coalesce(h.remote_host,''), coalesce(c.protocol,''), "
@@ -568,7 +639,7 @@ def guac_active():
         "from guacamole_connection_history h "
         "left join guacamole_connection c on c.connection_id = h.connection_id "
         f"where h.end_date is null and h.start_date >= '{started}' order by h.start_date"
-    )
+    ) if tunnels != 0 else ""
     fallback = recent_web_client_ips()
     fallback_ip = fallback[0] if len(fallback) == 1 else ""
 
@@ -641,7 +712,7 @@ def cmd_sessions(_args):
     lines = ["👥 ACTIVE SESSIONS"]
 
     lines.append("\n🌐 Guacamole (web)")
-    guac = guac_active()
+    guac = guac_active(purge=True)
     if guac is None:
         lines.append("  (could not read Guacamole state)")
     elif not guac:
@@ -655,6 +726,14 @@ def cmd_sessions(_args):
             lines.append(f"     ↳ {kind} \"{name}\" since {time.strftime('%H:%M:%S', time.localtime(start))}")
         if not s["conns"]:
             lines.append("     ↳ logged in, no connection open")
+
+    nu, nc = GUAC_NOTE["purged"]
+    if nu or nc:
+        lines.append(f"  🧹 cleaned {nu} expired login + {nc} expired connection records (backup in ~/backups)")
+    elif GUAC_NOTE["ignored"]:
+        lines.append(f"  ({GUAC_NOTE['ignored']} old records ignored: expired sessions Guacamole never closed)")
+    if GUAC_NOTE["tunnels"] is not None:
+        lines.append(f"  open remote connections (guacd): {GUAC_NOTE['tunnels']}")
 
     lines.append("\n🔑 SSH (direct)")
     ssh = ssh_logins()
@@ -767,7 +846,7 @@ def cmd_help(_args):
         "/intruders - last unauthorized access attempts (name, ID, time)\n"
         "/banned - blocked IPs by type (bots, search engines, SSH, port scans...)\n"
         "/banned <group> - full list: search, ai, bots, scanners, probe, portscan, sshd, guac, recidive\n"
-        "/sessions - who is connected: user, start time, client IP, ISP/ASN, via Guacamole/SSH/RDP\n"
+        "/sessions (or /session) - who is connected: user, start time, client IP, ISP/ASN, via Guacamole/SSH/RDP; also cleans expired Guacamole records\n"
         "/allbans - every banned IP on the VPS: all fail2ban jails, UFW, nginx deny files\n"
         "/unban - pick a banned IP from a list of buttons\n"
         "/unban <ip> [jail] - remove a ban (all jails, or just the one named)\n"
@@ -1047,6 +1126,7 @@ COMMANDS = {
     "/unban": cmd_unban,
     "/allbans": cmd_allbans,
     "/sessions": cmd_sessions,
+    "/session": cmd_sessions,
     "/reboot": cmd_reboot,
     "/help": cmd_help,
     "/start": cmd_help,
