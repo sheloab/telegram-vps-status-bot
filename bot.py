@@ -359,6 +359,13 @@ def container_block(name, stats):
     return text, xrdp_ok
 
 PROXY_IPS = {"172.20.0.1", "127.0.0.1", ""}
+# Your usual public IP(s), space-separated, from bot.env (USUAL_IPS). Login and connection alerts
+# from any other IP start with a warning. Empty = every alert carries the warning.
+USUAL_IPS = set(os.environ.get("USUAL_IPS", "").split())
+def unusual_ip_warning(ip, action="LOGGED IN"):
+    shown = ip if valid_ip(ip) and ip not in PROXY_IPS else "(unknown)"
+    return (f"⚠️ IS IT YOU WHO {action} USING THIS IP {shown}?\n"
+            "⚠️ CHECK YOUR CONNECTION AGAIN, ARE YOU USING A SECURE NETWORK?")
 # systemd unit name of this bot (shown in /status). Must match deploy/*.service.
 BOT_SERVICE = os.environ.get("BOT_SERVICE", "telegram-vps-status-bot")
 # Timezone for dates read from the Guacamole database (IANA name, e.g. Europe/Berlin).
@@ -1549,6 +1556,8 @@ def format_login_alert(row):
         lines.append("Auth: ⚠️ password accepted, but no completed 2FA login within 90s (wrong/missing code?)")
     if earlier == 0:
         lines.append("Not you? Change the password, reset 2FA and block the IP.")
+    if ip not in USUAL_IPS:
+        lines.insert(1, unusual_ip_warning(ip))
     return "\n".join(lines)
 
 
@@ -1783,6 +1792,8 @@ def format_connection_alert(row):
     else:
         lines.append(f"IP: {ip}")
     lines.append(f"Time: {when}")
+    if ip not in USUAL_IPS:
+        lines.insert(1, unusual_ip_warning(ip, "OPENED THIS CONNECTION"))
     return "\n".join(lines)
 
 
